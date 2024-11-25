@@ -190,6 +190,11 @@ private:
     KeyValueStore& kv_store;
     ConfigManager& config_manager;
 
+    bool isNumber(const std::string& s) {
+        return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
+    }
+
+
 public:
     CommandHandler(KeyValueStore& store, ConfigManager& cfg) 
         : kv_store(store), config_manager(cfg) {}
