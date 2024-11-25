@@ -13,6 +13,8 @@
 #include <mutex>
 #include <algorithm>
 #include <sstream>
+#include <unordered_map>
+#include <optional>
 
 // RESP Protocol Parser
 class RESPParser {
@@ -27,7 +29,6 @@ public:
         std::istringstream iss(input);
         std::string line;
 
-        // Read array length (*2\r\n)
         std::getline(iss, line, '\n');
         if (line[0] != '*') {
             throw std::runtime_error("Invalid RESP array");
@@ -38,11 +39,9 @@ public:
             throw std::runtime_error("Empty command");
         }
 
-        // Read command name
         readBulkString(iss, cmd.name);
         std::transform(cmd.name.begin(), cmd.name.end(), cmd.name.begin(), ::toupper);
 
-        // Read arguments
         for (int i = 1; i < arrayLen; i++) {
             std::string arg;
             readBulkString(iss, arg);
@@ -56,6 +55,10 @@ public:
         return "$" + std::to_string(str.length()) + "\r\n" + str + "\r\n";
     }
 
+    static std::string createNullBulkString() {
+        return "$-1\r\n";
+    }
+
     static std::string createSimpleString(const std::string& str) {
         return "+" + str + "\r\n";
     }
@@ -64,7 +67,6 @@ private:
     static void readBulkString(std::istringstream& iss, std::string& result) {
         std::string line;
         
-        // Read length line ($4\r\n)
         std::getline(iss, line, '\n');
         if (line[0] != '$') {
             throw std::runtime_error("Invalid bulk string");
@@ -75,29 +77,72 @@ private:
             throw std::runtime_error("Null bulk string");
         }
 
-        // Read the actual string
         char* buffer = new char[strLen + 1];
         iss.read(buffer, strLen);
         buffer[strLen] = '\0';
         result = std::string(buffer);
         delete[] buffer;
 
-        // Read trailing \r\n
         iss.ignore(2);
+    }
+};
+
+// Key-Value Store
+class KeyValueStore {
+private:
+    std::unordered_map<std::string, std::string> store;
+    std::mutex mutex;
+
+public:
+    void set(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        store[key] = value;
+    }
+
+    std::optional<std::string> get(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = store.find(key);
+        if (it != store.end()) {
+            return it->second;
+        }
+        return std::nullopt;
     }
 };
 
 // Command Handler
 class CommandHandler {
+private:
+    KeyValueStore& kv_store;
+
 public:
-    static std::string handleCommand(const RESPParser::Command& cmd) {
+    CommandHandler(KeyValueStore& store) : kv_store(store) {}
+
+    std::string handleCommand(const RESPParser::Command& cmd) {
         if (cmd.name == "PING") {
             return RESPParser::createSimpleString("PONG");
-        } else if (cmd.name == "ECHO") {
+        } 
+        else if (cmd.name == "ECHO") {
             if (cmd.args.empty()) {
                 throw std::runtime_error("ECHO command requires an argument");
             }
             return RESPParser::createBulkString(cmd.args[0]);
+        }
+        else if (cmd.name == "SET") {
+            if (cmd.args.size() < 2) {
+                throw std::runtime_error("SET command requires key and value arguments");
+            }
+            kv_store.set(cmd.args[0], cmd.args[1]);
+            return RESPParser::createSimpleString("OK");
+        }
+        else if (cmd.name == "GET") {
+            if (cmd.args.empty()) {
+                throw std::runtime_error("GET command requires a key argument");
+            }
+            auto value = kv_store.get(cmd.args[0]);
+            if (value) {
+                return RESPParser::createBulkString(*value);
+            }
+            return RESPParser::createNullBulkString();
         }
         throw std::runtime_error("Unknown command");
     }
@@ -114,6 +159,8 @@ private:
     std::vector<std::thread> client_threads;
     std::mutex cout_mutex;
     bool running;
+    KeyValueStore kv_store;
+    CommandHandler command_handler;
 
     void setupServerSocket() {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -166,9 +213,8 @@ private:
             buffer[bytes_read] = '\0';
             
             try {
-                // Parse and handle the command
                 RESPParser::Command cmd = RESPParser::parseCommand(buffer);
-                std::string response = CommandHandler::handleCommand(cmd);
+                std::string response = command_handler.handleCommand(cmd);
                 
                 if (send(client_fd, response.c_str(), response.length(), 0) < 0) {
                     logMessage("Error sending response");
@@ -204,7 +250,10 @@ private:
     }
 
 public:
-    RedisServer() : server_fd(-1), running(true) {
+    RedisServer() : 
+        server_fd(-1), 
+        running(true),
+        command_handler(kv_store) {
         setupServerSocket();
         bindSocket();
         startListening();
