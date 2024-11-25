@@ -15,6 +15,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <optional>
+#include <chrono>
 
 // RESP Protocol Parser
 class RESPParser {
@@ -87,23 +88,46 @@ private:
     }
 };
 
-// Key-Value Store
+// Key-Value Store with Expiry
 class KeyValueStore {
 private:
-    std::unordered_map<std::string, std::string> store;
+    struct ValueWithExpiry {
+        std::string value;
+        std::optional<std::chrono::steady_clock::time_point> expiry;
+    };
+    
+    std::unordered_map<std::string, ValueWithExpiry> store;
     std::mutex mutex;
 
+    bool isExpired(const ValueWithExpiry& entry) const {
+        if (!entry.expiry) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() > *entry.expiry;
+    }
+
 public:
-    void set(const std::string& key, const std::string& value) {
+    void set(const std::string& key, const std::string& value, 
+             std::optional<std::chrono::milliseconds> expiry = std::nullopt) {
         std::lock_guard<std::mutex> lock(mutex);
-        store[key] = value;
+        
+        ValueWithExpiry entry{value, std::nullopt};
+        if (expiry) {
+            entry.expiry = std::chrono::steady_clock::now() + *expiry;
+        }
+        
+        store[key] = entry;
     }
 
     std::optional<std::string> get(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = store.find(key);
         if (it != store.end()) {
-            return it->second;
+            if (!isExpired(it->second)) {
+                return it->second.value;
+            }
+            // Clean up expired key
+            store.erase(it);
         }
         return std::nullopt;
     }
@@ -113,6 +137,10 @@ public:
 class CommandHandler {
 private:
     KeyValueStore& kv_store;
+
+    bool isNumber(const std::string& s) {
+        return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
+    }
 
 public:
     CommandHandler(KeyValueStore& store) : kv_store(store) {}
@@ -131,7 +159,18 @@ public:
             if (cmd.args.size() < 2) {
                 throw std::runtime_error("SET command requires key and value arguments");
             }
-            kv_store.set(cmd.args[0], cmd.args[1]);
+            
+            std::optional<std::chrono::milliseconds> expiry;
+            if (cmd.args.size() >= 4) {
+                std::string px_arg = cmd.args[2];
+                std::transform(px_arg.begin(), px_arg.end(), px_arg.begin(), ::toupper);
+                
+                if (px_arg == "PX" && isNumber(cmd.args[3])) {
+                    expiry = std::chrono::milliseconds(std::stoll(cmd.args[3]));
+                }
+            }
+            
+            kv_store.set(cmd.args[0], cmd.args[1], expiry);
             return RESPParser::createSimpleString("OK");
         }
         else if (cmd.name == "GET") {
