@@ -16,6 +16,7 @@ private:
     struct sockaddr_in client_addr;
     const int PORT = 6379;
     const int CONNECTION_BACKLOG = 5;
+    const int BUFFER_SIZE = 1024;
 
     void setupServerSocket() {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -48,24 +49,45 @@ private:
     }
 
     void handleClient() {
-        // For now, we'll just send PONG response regardless of input
+        char buffer[BUFFER_SIZE];
         const char* response = "+PONG\r\n";
-        send(client_fd, response, strlen(response), 0);
+        
+        while (true) {
+            // Read from client
+            ssize_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+            
+            // Handle client disconnect or error
+            if (bytes_read <= 0) {
+                if (bytes_read == 0) {
+                    std::cout << "Client disconnected\n";
+                } else {
+                    std::cerr << "Error reading from client\n";
+                }
+                break;
+            }
+
+            // For this stage, we respond with PONG for any input
+            // We'll add proper command parsing in later stages
+            if (send(client_fd, response, strlen(response), 0) < 0) {
+                std::cerr << "Error sending response\n";
+                break;
+            }
+        }
     }
 
 public:
-    RedisServer() {
+    RedisServer() : server_fd(-1), client_fd(-1) {
         setupServerSocket();
         bindSocket();
         startListening();
     }
 
     ~RedisServer() {
-        if (server_fd >= 0) {
-            close(server_fd);
-        }
         if (client_fd >= 0) {
             close(client_fd);
+        }
+        if (server_fd >= 0) {
+            close(server_fd);
         }
     }
 
