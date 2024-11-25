@@ -7,16 +7,22 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <thread>
+#include <vector>
+#include <memory>
+#include <mutex>
 
 class RedisServer {
 private:
     int server_fd;
-    int client_fd;
     struct sockaddr_in server_addr;
-    struct sockaddr_in client_addr;
     const int PORT = 6379;
     const int CONNECTION_BACKLOG = 5;
     const int BUFFER_SIZE = 1024;
+    
+    std::vector<std::thread> client_threads;
+    std::mutex cout_mutex; // For thread-safe console output
+    bool running;
 
     void setupServerSocket() {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -48,61 +54,90 @@ private:
         }
     }
 
-    void handleClient() {
+    void logMessage(const std::string& message) {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << message << std::endl;
+    }
+
+    void handleClient(int client_fd) {
         char buffer[BUFFER_SIZE];
         const char* response = "+PONG\r\n";
         
-        while (true) {
+        while (running) {
             // Read from client
             ssize_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
             
             // Handle client disconnect or error
             if (bytes_read <= 0) {
                 if (bytes_read == 0) {
-                    std::cout << "Client disconnected\n";
+                    logMessage("Client disconnected");
                 } else {
-                    std::cerr << "Error reading from client\n";
+                    logMessage("Error reading from client");
                 }
                 break;
             }
 
-            // For this stage, we respond with PONG for any input
-            // We'll add proper command parsing in later stages
+            // Send PONG response
             if (send(client_fd, response, strlen(response), 0) < 0) {
-                std::cerr << "Error sending response\n";
+                logMessage("Error sending response");
                 break;
             }
+        }
+
+        close(client_fd);
+    }
+
+    void acceptClients() {
+        while (running) {
+            struct sockaddr_in client_addr;
+            int client_addr_len = sizeof(client_addr);
+            
+            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addr_len);
+            
+            if (client_fd < 0) {
+                logMessage("Failed to accept client connection");
+                continue;
+            }
+
+            logMessage("Client connected");
+            
+            // Create a new thread to handle this client
+            client_threads.emplace_back([this, client_fd]() {
+                handleClient(client_fd);
+            });
         }
     }
 
 public:
-    RedisServer() : server_fd(-1), client_fd(-1) {
+    RedisServer() : server_fd(-1), running(true) {
         setupServerSocket();
         bindSocket();
         startListening();
     }
 
     ~RedisServer() {
-        if (client_fd >= 0) {
-            close(client_fd);
-        }
+        stop();
+        
         if (server_fd >= 0) {
             close(server_fd);
         }
     }
 
     void start() {
-        std::cout << "Waiting for a client to connect...\n";
+        logMessage("Server starting... Waiting for clients to connect...");
+        acceptClients();
+    }
+
+    void stop() {
+        running = false;
         
-        int client_addr_len = sizeof(client_addr);
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addr_len);
-        
-        if (client_fd < 0) {
-            throw std::runtime_error("Failed to accept client connection");
+        // Wait for all client threads to finish
+        for (auto& thread : client_threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
         }
-        
-        std::cout << "Client connected\n";
-        handleClient();
+        client_threads.clear();
     }
 };
 
