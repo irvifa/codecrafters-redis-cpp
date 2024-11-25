@@ -17,6 +17,49 @@
 #include <optional>
 #include <chrono>
 
+// Configuration Manager
+class ConfigManager {
+private:
+    std::unordered_map<std::string, std::string> config;
+    std::mutex mutex;
+
+public:
+    ConfigManager() {
+        // Set default values
+        config["dir"] = "./";
+        config["dbfilename"] = "dump.rdb";
+    }
+
+    void parseArgs(int argc, char** argv) {
+        for (int i = 1; i < argc; i += 2) {
+            if (i + 1 >= argc) break;
+            
+            std::string arg = argv[i];
+            std::string value = argv[i + 1];
+            
+            if (arg == "--dir") {
+                set("dir", value);
+            } else if (arg == "--dbfilename") {
+                set("dbfilename", value);
+            }
+        }
+    }
+
+    void set(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        config[key] = value;
+    }
+
+    std::optional<std::string> get(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = config.find(key);
+        if (it != config.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+};
+
 // RESP Protocol Parser
 class RESPParser {
 public:
@@ -56,6 +99,14 @@ public:
         return "$" + std::to_string(str.length()) + "\r\n" + str + "\r\n";
     }
 
+    static std::string createArray(const std::vector<std::string>& elements) {
+        std::string result = "*" + std::to_string(elements.size()) + "\r\n";
+        for (const auto& element : elements) {
+            result += createBulkString(element);
+        }
+        return result;
+    }
+
     static std::string createNullBulkString() {
         return "$-1\r\n";
     }
@@ -88,7 +139,7 @@ private:
     }
 };
 
-// Key-Value Store with Expiry
+// Key-Value Store
 class KeyValueStore {
 private:
     struct ValueWithExpiry {
@@ -137,13 +188,11 @@ public:
 class CommandHandler {
 private:
     KeyValueStore& kv_store;
-
-    bool isNumber(const std::string& s) {
-        return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
-    }
+    ConfigManager& config_manager;
 
 public:
-    CommandHandler(KeyValueStore& store) : kv_store(store) {}
+    CommandHandler(KeyValueStore& store, ConfigManager& cfg) 
+        : kv_store(store), config_manager(cfg) {}
 
     std::string handleCommand(const RESPParser::Command& cmd) {
         if (cmd.name == "PING") {
@@ -154,6 +203,24 @@ public:
                 throw std::runtime_error("ECHO command requires an argument");
             }
             return RESPParser::createBulkString(cmd.args[0]);
+        }
+        else if (cmd.name == "CONFIG") {
+            if (cmd.args.size() < 2) {
+                throw std::runtime_error("CONFIG command requires subcommand and parameter");
+            }
+            
+            std::string subcommand = cmd.args[0];
+            std::transform(subcommand.begin(), subcommand.end(), subcommand.begin(), ::toupper);
+            
+            if (subcommand == "GET") {
+                std::string param = cmd.args[1];
+                auto value = config_manager.get(param);
+                if (!value) {
+                    throw std::runtime_error("Unknown config parameter");
+                }
+                return RESPParser::createArray({param, *value});
+            }
+            throw std::runtime_error("Unknown CONFIG subcommand");
         }
         else if (cmd.name == "SET") {
             if (cmd.args.size() < 2) {
@@ -199,6 +266,7 @@ private:
     std::mutex cout_mutex;
     bool running;
     KeyValueStore kv_store;
+    ConfigManager config_manager;
     CommandHandler command_handler;
 
     void setupServerSocket() {
@@ -289,10 +357,11 @@ private:
     }
 
 public:
-    RedisServer() : 
+    RedisServer(int argc, char** argv) : 
         server_fd(-1), 
         running(true),
-        command_handler(kv_store) {
+        command_handler(kv_store, config_manager) {
+        config_manager.parseArgs(argc, argv);
         setupServerSocket();
         bindSocket();
         startListening();
@@ -326,7 +395,7 @@ int main(int argc, char** argv) {
     std::cerr << std::unitbuf;
 
     try {
-        RedisServer server;
+        RedisServer server(argc, argv);
         server.start();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
