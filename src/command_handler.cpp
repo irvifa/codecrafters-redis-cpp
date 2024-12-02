@@ -1,6 +1,8 @@
 #include "command_handler.hpp"
+#include "rdb_reader.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <iostream>
 
 CommandHandler::CommandHandler(KeyValueStore& store, ConfigManager& cfg) 
     : kv_store(store), config_manager(cfg) {}
@@ -64,6 +66,29 @@ std::string CommandHandler::handleCommand(const RESPParser::Command& cmd) {
             return RESPParser::createBulkString(*value);
         }
         return RESPParser::createNullBulkString();
+    }
+    else if (cmd.name == "KEYS") {
+        if (cmd.args.empty()) {
+            throw std::runtime_error("KEYS command requires a pattern argument");
+        }
+
+        if (cmd.args[0] == "*") {
+            try {
+                std::string dbdir = config_manager.get("dir").value_or("");
+                std::string dbfilename = config_manager.get("dbfilename").value_or("");
+                std::string full_path = dbdir + "/" + dbfilename;
+
+                RDBReader reader(full_path);
+                auto keys = reader.readKeys();
+
+                return RESPParser::createArray(keys);
+            } catch (const std::exception& e) {
+                // Log the error if needed
+                return RESPParser::createArray({});
+            }
+        }
+
+        return RESPParser::createArray({});
     }
     throw std::runtime_error("Unknown command");
 }
